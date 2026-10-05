@@ -1,0 +1,133 @@
+name: daily dlss
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Blender branch, tag, or commit to build
+        required: false
+        default: main
+        type: string
+      dlss_ref:
+        description: NVIDIA DLSS SDK tag
+        required: false
+        default: v310.9.1
+        type: string
+      cuda_arch:
+        description: CUDA architectures for the Cycles kernels
+        required: false
+        default: sm_75;sm_86;sm_89;sm_90;sm_120;compute_75
+        type: string
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-dlss-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Blender fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+          fetch-depth: 0
+          # make update installs the official LFS fallback for GitHub forks.
+          lfs: false
+
+      - name: Checkout NVIDIA DLSS SDK
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/DLSS
+          ref: ${{ inputs.dlss_ref || 'v310.9.1' }}
+          path: third_party/DLSS
+          fetch-depth: 1
+          lfs: true
+
+      - name: Cache Blender precompiled libraries
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\..\lib
+          key: blender-win-libs-${{ hashFiles('build_files/build_environment/cmake/versions.cmake', 'build_files/build_environment/cmake/options.cmake') }}
+          restore-keys: |
+            blender-win-libs-
+
+      - name: Update Blender dependencies
+        shell: cmd
+        run: make.bat update
+
+      - name: Configure Blender with DLSS
+        shell: cmd
+        env:
+          DLSS_SDK_ROOT: ${{ github.workspace }}\third_party\DLSS
+        run: make.bat release nobuild
+
+      - name: Build Blender with DLSS
+        shell: pwsh
+        env:
+          DLSS_SDK_ROOT: ${{ github.workspace }}\third_party\DLSS
+        run: |
+          $buildDir = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE '..') -Directory -Filter 'build_windows*' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $buildDir) { throw 'Blender build directory was not found' }
+
+          $arch = '${{ inputs.cuda_arch || 'sm_75;sm_86;sm_89;sm_90;sm_120;compute_75' }}'
+          & cmake -S $env:GITHUB_WORKSPACE -B $buildDir.FullName "-DCYCLES_CUDA_BINARIES_ARCH=$arch"
+          if ($LASTEXITCODE -ne 0) { throw "CMake reconfiguration failed with exit code $LASTEXITCODE" }
+
+          & cmake --build $buildDir.FullName --target INSTALL --config Release -- /m:2
+          if ($LASTEXITCODE -ne 0) { throw "Blender build failed with exit code $LASTEXITCODE" }
+
+      - name: Verify DLSS was compiled in
+        shell: pwsh
+        run: |
+          $blender = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE '..') -Filter blender.exe -File -Recurse |
+            Where-Object { $_.FullName -match '\\bin\\Release\\blender\.exe$' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $blender) { throw 'blender.exe was not found' }
+          & $blender.FullName --background --factory-startup --python-expr "import _cycles; assert _cycles.with_dlss, 'Blender was built without DLSS'; print('DLSS compile flag: ON')"
+          if ($LASTEXITCODE -ne 0) { throw "Blender self-check failed with exit code $LASTEXITCODE" }
+
+      - name: Package portable build
+        shell: pwsh
+        run: |
+          $blender = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE '..') -Filter blender.exe -File -Recurse |
+            Where-Object { $_.FullName -match '\\bin\\Release\\blender\.exe$' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $blender) { throw 'blender.exe was not found' }
+
+          $root = $blender.Directory.FullName
+          Get-ChildItem -Path $root -Recurse -File -Include 'nvngx_dlss*.dll' -ErrorAction SilentlyContinue |
+            Remove-Item -Force
+
+          @"
+          daily dlss build
+          Blender ref: ${{ inputs.ref || 'main' }}
+          DLSS SDK: ${{ inputs.dlss_ref || 'v310.9.1' }}
+          Commit: ${{ github.sha }}
+
+          This artifact contains the Blender binary built with native Cycles DLSS support.
+          It does not redistribute NVIDIA runtime DLLs. Test on an NVIDIA RTX GPU with a
+          supported driver, then select Cycles > Sampling > Viewport > Denoise > DLSS.
+          "@ | Set-Content -Encoding utf8 (Join-Path $root 'DAILY_DLSS_README.txt')
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE "daily-dlss-${{ github.run_number }}.zip"
+          Compress-Archive -Path (Join-Path $root '*') -DestinationPath $zip -CompressionLevel Optimal
+
+      - name: Upload Blender artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-dlss-${{ github.run_number }}
+          path: ${{ github.workspace }}\daily-dlss-${{ github.run_number }}.zip
+          if-no-files-found: error
+          retention-days: 7
