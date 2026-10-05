@@ -4,21 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Blender branch, tag, or commit to build
+        description: Fork branch/tag/commit (empty builds latest official Blender main)
         required: false
-        default: main
-        type: string
-      dlss_ref:
-        description: NVIDIA DLSS SDK tag
-        required: false
-        default: v310.9.1
+        default: ""
         type: string
       cuda_arch:
-        description: CUDA architectures for the Cycles kernels
+        description: Cycles CUDA architectures, separated by semicolons
         required: false
         default: sm_75;sm_86;sm_89;sm_90;sm_120;compute_75
         type: string
   schedule:
+    # 10:17 Asia/Shanghai; GitHub may delay scheduled runs.
     - cron: "17 2 * * *"
 
 permissions:
@@ -32,111 +28,197 @@ jobs:
   build:
     runs-on: windows-2022
     timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CUDA_ARCH: ${{ inputs.cuda_arch || 'sm_75;sm_86;sm_89;sm_90;sm_120;compute_75' }}
 
     steps:
       - name: Checkout Blender fork
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || 'main' }}
-          fetch-depth: 0
-          # make update installs the official LFS fallback for GitHub forks.
+          ref: ${{ inputs.ref || github.event.repository.default_branch }}
+          fetch-depth: 1
           lfs: false
+          persist-credentials: false
 
-      - name: Checkout NVIDIA DLSS SDK
+      - name: Select source and fetch build assets
+        id: source
+        env:
+          SOURCE_REF: ${{ inputs.ref }}
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          git remote add upstream https://projects.blender.org/blender/blender.git
+          if ($LASTEXITCODE) { throw 'Cannot add official upstream' }
+          if (-not $env:SOURCE_REF) {
+            git fetch --depth 1 upstream main
+            if ($LASTEXITCODE) { throw 'Cannot fetch official Blender main' }
+            git checkout --detach FETCH_HEAD
+            if ($LASTEXITCODE) { throw 'Cannot select upstream commit' }
+          }
+          git lfs pull upstream --exclude='tests/**'
+          if ($LASTEXITCODE) { throw 'Cannot download Blender build assets' }
+          $sha = git rev-parse HEAD
+          if ($LASTEXITCODE) { throw 'Cannot resolve source commit' }
+          $lib = (git ls-tree HEAD lib/windows_x64) -split '\s+'
+          if ($LASTEXITCODE -or $lib.Length -lt 3) { throw 'Windows library revision is missing' }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "libs=$($lib[2])" >> $env:GITHUB_OUTPUT
+          "BLENDER_SHA=$sha" >> $env:GITHUB_ENV
+          "BUILD_DIR=$env:RUNNER_TEMP\blender-build" >> $env:GITHUB_ENV
+          "PACKAGE_DIR=$env:RUNNER_TEMP\daily-dlss" >> $env:GITHUB_ENV
+
+      - name: Restore official Windows libraries
+        id: libs
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            lib/windows_x64
+            .git/modules/lib/windows_x64
+          key: blender-windows-x64-${{ steps.source.outputs.libs }}
+
+      - name: Fetch official Windows libraries
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          git config --local submodule.lib/windows_x64.update checkout
+          git submodule update --init --checkout --depth 1 lib/windows_x64
+          if ($LASTEXITCODE) { throw 'Windows library checkout failed' }
+          git -C lib/windows_x64 lfs pull
+          if ($LASTEXITCODE) { throw 'Windows library download failed' }
+
+      - name: Save official Windows libraries
+        if: steps.libs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            lib/windows_x64
+            .git/modules/lib/windows_x64
+          key: ${{ steps.libs.outputs.cache-primary-key }}
+
+      - name: Checkout DLSS SDK headers (v310.9.1)
         uses: actions/checkout@v4
         with:
           repository: NVIDIA/DLSS
-          ref: ${{ inputs.dlss_ref || 'v310.9.1' }}
+          ref: 374959484e79a640feaba44c93ac8cfb0a03f5b5
           path: third_party/DLSS
-          fetch-depth: 1
-          lfs: true
+          persist-credentials: false
+          sparse-checkout: |
+            include
+          lfs: false
 
-      - name: Cache Blender precompiled libraries
-        uses: actions/cache@v4
+      - name: Checkout OptiX SDK headers (v9.0.0)
+        uses: actions/checkout@v4
         with:
-          path: ${{ github.workspace }}\lib\windows_x64
-          key: blender-win-libs-${{ hashFiles('build_files/build_environment/cmake/versions.cmake', 'build_files/build_environment/cmake/options.cmake') }}
-          restore-keys: |
-            blender-win-libs-
+          repository: NVIDIA/optix-dev
+          ref: fff65c2a7c592f1ea5f1661ad7d2381cf965f9bd
+          path: third_party/OptiX
+          persist-credentials: false
 
-      - name: Fetch Blender precompiled libraries
-        shell: cmd
+      - name: Install CUDA compiler and runtime headers
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '12.9.1'
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+          use-github-cache: false
+
+      - name: Set up MSVC environment
         run: |
-          git config --local submodule.lib/windows_x64.update checkout
-          set GIT_LFS_SKIP_SMUDGE=1
-          git submodule update --init --depth 1 lib/windows_x64
-          set GIT_LFS_SKIP_SMUDGE=
-          git -C lib/windows_x64 lfs pull
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -or -not $vs) { throw 'Visual Studio C++ tools were not found' }
+          $batch = Join-Path $env:RUNNER_TEMP 'daily-dlss-msvc.cmd'
+          "@call `"$vs\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 >nul`n@if errorlevel 1 exit /b 1`n@set" | Set-Content $batch
+          $vars = & cmd /d /c $batch
+          if ($LASTEXITCODE) { throw 'Visual Studio environment setup failed' }
+          foreach ($line in $vars) {
+            if ($line -match '^(PATH|INCLUDE|LIB|LIBPATH|VCToolsRedistDir)=(.*)$') {
+              $line >> $env:GITHUB_ENV
+            }
+          }
 
-      - name: Update Blender dependencies
-        shell: cmd
-        run: make.bat update
+      - name: Configure Release with DLSS, CUDA and OptiX
+        run: |
+          if ($env:CUDA_ARCH -notmatch '^(sm|compute)_[0-9]+(;(?:sm|compute)_[0-9]+)*$') {
+            throw 'Invalid CUDA architectures; use e.g. sm_89;compute_75'
+          }
+          & nvcc --version
+          if ($LASTEXITCODE) { throw 'CUDA compiler is unavailable' }
+          $cmakeArgs = @(
+            '-S', $env:GITHUB_WORKSPACE, '-B', $env:BUILD_DIR,
+            '-G', 'Visual Studio 17 2022', '-A', 'x64',
+            '-C', "$env:GITHUB_WORKSPACE/build_files/cmake/config/blender_release.cmake",
+            "-DCMAKE_INSTALL_PREFIX=$env:PACKAGE_DIR",
+            "-DDLSS_SDK_ROOT=$env:GITHUB_WORKSPACE/third_party/DLSS",
+            "-DOPTIX_ROOT_DIR=$env:GITHUB_WORKSPACE/third_party/OptiX",
+            "-DCUDA_TOOLKIT_ROOT_DIR=$env:CUDA_PATH",
+            "-DCYCLES_CUDA_BINARIES_ARCH=$env:CUDA_ARCH",
+            '-DWITH_DLSS=ON', '-DWITH_CYCLES_DEVICE_CUDA=ON',
+            '-DWITH_CYCLES_DEVICE_OPTIX=ON', '-DWITH_CYCLES_CUDA_BINARIES=ON',
+            '-DWITH_CYCLES_CUDA_BUILD_SERIAL=ON',
+            '-DWITH_CYCLES_HIP_BINARIES=OFF', '-DWITH_CYCLES_ONEAPI_BINARIES=OFF',
+            '-DWITH_CYCLES_HIPRT=OFF', '-DWITH_GTESTS=OFF'
+          )
+          & cmake @cmakeArgs
+          if ($LASTEXITCODE) { throw "CMake configure failed: $LASTEXITCODE" }
 
-      - name: Configure Blender with DLSS
-        shell: cmd
+      - name: Build and install portable Blender
+        run: |
+          & cmake --build $env:BUILD_DIR --target INSTALL --config Release -- /m:2 /verbosity:minimal
+          if ($LASTEXITCODE) { throw "Blender build failed: $LASTEXITCODE" }
+
+      - name: Verify compiled features and GPU kernels
+        run: |
+          $blender = Join-Path $env:PACKAGE_DIR 'blender.exe'
+          if (-not (Test-Path $blender)) { throw 'Installed blender.exe is missing' }
+          $check = "import _cycles; assert _cycles.with_dlss, 'DLSS disabled'; d = _cycles.get_device_types(); assert d[0] and d[1], ('CUDA/OptiX disabled', d); print('DLSS, CUDA, OptiX compile checks passed')"
+          & $blender --background --factory-startup --python-exit-code 1 --python-expr $check
+          if ($LASTEXITCODE) { throw "Blender self-check failed: $LASTEXITCODE" }
+          $kernels = @(Get-ChildItem $env:PACKAGE_DIR -Recurse -File -Filter '*.cubin*')
+          $ptx = @(Get-ChildItem $env:PACKAGE_DIR -Recurse -File -Filter '*.ptx*')
+          if (-not $kernels.Count -or -not $ptx.Count) { throw 'Packaged CUDA/OptiX kernels are missing' }
+
+      - name: Package ZIP and record source versions
         env:
-          DLSS_SDK_ROOT: ${{ github.workspace }}\third_party\DLSS
-        run: make.bat release nobuild
-
-      - name: Build Blender with DLSS
-        shell: pwsh
-        env:
-          DLSS_SDK_ROOT: ${{ github.workspace }}\third_party\DLSS
+          LIB_SHA: ${{ steps.source.outputs.libs }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          $buildDir = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE '..') -Directory -Filter 'build_windows*' |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $buildDir) { throw 'Blender build directory was not found' }
-
-          $arch = '${{ inputs.cuda_arch || 'sm_75;sm_86;sm_89;sm_90;sm_120;compute_75' }}'
-          & cmake -S $env:GITHUB_WORKSPACE -B $buildDir.FullName "-DCYCLES_CUDA_BINARIES_ARCH=$arch"
-          if ($LASTEXITCODE -ne 0) { throw "CMake reconfiguration failed with exit code $LASTEXITCODE" }
-
-          & cmake --build $buildDir.FullName --target INSTALL --config Release -- /m:2
-          if ($LASTEXITCODE -ne 0) { throw "Blender build failed with exit code $LASTEXITCODE" }
-
-      - name: Verify DLSS was compiled in
-        shell: pwsh
-        run: |
-          $blender = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE '..') -Filter blender.exe -File -Recurse |
-            Where-Object { $_.FullName -match '\\bin\\Release\\blender\.exe$' } |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $blender) { throw 'blender.exe was not found' }
-          & $blender.FullName --background --factory-startup --python-expr "import _cycles; assert _cycles.with_dlss, 'Blender was built without DLSS'; print('DLSS compile flag: ON')"
-          if ($LASTEXITCODE -ne 0) { throw "Blender self-check failed with exit code $LASTEXITCODE" }
-
-      - name: Package portable build
-        shell: pwsh
-        run: |
-          $blender = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE '..') -Filter blender.exe -File -Recurse |
-            Where-Object { $_.FullName -match '\\bin\\Release\\blender\.exe$' } |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $blender) { throw 'blender.exe was not found' }
-
-          $root = $blender.Directory.FullName
-          Get-ChildItem -Path $root -Recurse -File -Include 'nvngx_dlss*.dll' -ErrorAction SilentlyContinue |
-            Remove-Item -Force
-
+          $dlss = git -C third_party/DLSS rev-parse HEAD
+          if ($LASTEXITCODE) { throw 'Cannot resolve DLSS SDK commit' }
+          $optix = git -C third_party/OptiX rev-parse HEAD
+          if ($LASTEXITCODE) { throw 'Cannot resolve OptiX SDK commit' }
           @"
-          daily dlss build
-          Blender ref: ${{ inputs.ref || 'main' }}
-          DLSS SDK: ${{ inputs.dlss_ref || 'v310.9.1' }}
-          Commit: ${{ github.sha }}
+          daily dlss - Windows x64 portable Blender
+          Blender source: https://projects.blender.org/blender/blender/commit/$env:BLENDER_SHA
+          Blender commit: $env:BLENDER_SHA
+          Windows libraries: $env:LIB_SHA
+          DLSS SDK v310.9.1: $dlss
+          OptiX SDK v9.0.0: $optix
+          CUDA compiler: 12.9.1
+          CUDA architectures: $env:CUDA_ARCH
 
-          This artifact contains the Blender binary built with native Cycles DLSS support.
-          It does not redistribute NVIDIA runtime DLLs. Test on an NVIDIA RTX GPU with a
-          supported driver, then select Cycles > Sampling > Viewport > Denoise > DLSS.
-          "@ | Set-Content -Encoding utf8 (Join-Path $root 'DAILY_DLSS_README.txt')
+          Compile checks passed for DLSS, CUDA and OptiX. Actual GPU rendering is
+          not tested on the GitHub runner. DLSS needs a compatible NVIDIA RTX GPU
+          and driver. This build does not bundle NVIDIA DLSS runtime DLLs.
+          Select Cycles > Sampling > Viewport > Denoise > DLSS to try it.
+          SDK version 310.9.1 alone does not prove a DLSS 4.5 runtime/model is active.
+          "@ | Set-Content -Encoding utf8 (Join-Path $env:PACKAGE_DIR 'DAILY_DLSS_README.txt')
+          $zip = Join-Path $env:GITHUB_WORKSPACE "daily-dlss-$env:RUN_NUMBER-windows-x64.zip"
+          & 7z a -tzip -mx=3 $zip "$env:PACKAGE_DIR\*"
+          if ($LASTEXITCODE) { throw "ZIP packaging failed: $LASTEXITCODE" }
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -Encoding ascii "$zip.sha256"
+          "Built Blender ``$env:BLENDER_SHA`` with DLSS, CUDA and OptiX. Download the ZIP from Artifacts." >> $env:GITHUB_STEP_SUMMARY
 
-          $zip = Join-Path $env:GITHUB_WORKSPACE "daily-dlss-${{ github.run_number }}.zip"
-          Compress-Archive -Path (Join-Path $root '*') -DestinationPath $zip -CompressionLevel Optimal
-
-      - name: Upload Blender artifact
+      - name: Upload portable Blender
         uses: actions/upload-artifact@v4
         with:
-          name: daily-dlss-${{ github.run_number }}
-          path: ${{ github.workspace }}\daily-dlss-${{ github.run_number }}.zip
+          name: daily-dlss-${{ github.run_number }}-windows-x64
+          path: |
+            daily-dlss-*-windows-x64.zip
+            daily-dlss-*-windows-x64.zip.sha256
           if-no-files-found: error
-          retention-days: 7
+          compression-level: 0
+          retention-days: 3
