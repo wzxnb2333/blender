@@ -61,7 +61,12 @@ jobs:
 
       - name: Fetch Blender precompiled libraries
         shell: cmd
-        run: git submodule update --init --depth 1 lib/windows_x64
+        run: |
+          git config --local submodule.lib/windows_x64.update checkout
+          set GIT_LFS_SKIP_SMUDGE=1
+          git submodule update --init --depth 1 lib/windows_x64
+          set GIT_LFS_SKIP_SMUDGE=
+          git -C lib/windows_x64 lfs pull
 
       - name: Update Blender dependencies
         shell: cmd
