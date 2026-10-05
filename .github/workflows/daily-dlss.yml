@@ -146,27 +146,31 @@ jobs:
           }
           & nvcc --version
           if ($LASTEXITCODE) { throw 'CUDA compiler is unavailable' }
+          # FindCUDA evaluates path strings; backslashes become CMake escapes.
+          $sourceRoot = $env:GITHUB_WORKSPACE.Replace('\', '/')
+          $cudaRoot = $env:CUDA_PATH.Replace('\', '/')
+          $packageRoot = $env:PACKAGE_DIR.Replace('\', '/')
           $cmakeArgs = @(
             '-S', $env:GITHUB_WORKSPACE, '-B', $env:BUILD_DIR,
             '-G', 'Visual Studio 17 2022', '-A', 'x64',
             '-C', "$env:GITHUB_WORKSPACE/build_files/cmake/config/blender_release.cmake",
-            "-DCMAKE_INSTALL_PREFIX=$env:PACKAGE_DIR",
-            "-DDLSS_SDK_ROOT=$env:GITHUB_WORKSPACE/third_party/DLSS",
-            "-DOPTIX_ROOT_DIR=$env:GITHUB_WORKSPACE/third_party/OptiX",
-            "-DCUDA_TOOLKIT_ROOT_DIR=$env:CUDA_PATH",
+            "-DCMAKE_INSTALL_PREFIX=$packageRoot",
+            "-DDLSS_SDK_ROOT=$sourceRoot/third_party/DLSS",
+            "-DOPTIX_ROOT_DIR=$sourceRoot/third_party/OptiX",
+            "-DCUDA_TOOLKIT_ROOT_DIR=$cudaRoot",
             "-DCYCLES_CUDA_BINARIES_ARCH=$env:CUDA_ARCH",
             '-DWITH_DLSS=ON', '-DWITH_CYCLES_DEVICE_CUDA=ON',
             '-DWITH_CYCLES_DEVICE_OPTIX=ON', '-DWITH_CYCLES_CUDA_BINARIES=ON',
             '-DWITH_CYCLES_CUDA_BUILD_SERIAL=ON',
             '-DWITH_CYCLES_HIP_BINARIES=OFF', '-DWITH_CYCLES_ONEAPI_BINARIES=OFF',
-            '-DWITH_CYCLES_HIPRT=OFF', '-DWITH_GTESTS=OFF'
+            '-DWITH_CYCLES_DEVICE_HIPRT=OFF', '-DWITH_GTESTS=OFF'
           )
           & cmake @cmakeArgs
           if ($LASTEXITCODE) { throw "CMake configure failed: $LASTEXITCODE" }
 
       - name: Build and install portable Blender
         run: |
-          & cmake --build $env:BUILD_DIR --target INSTALL --config Release -- /m:2 /verbosity:minimal
+          & cmake --build $env:BUILD_DIR --target INSTALL --config Release -- /m:2 /p:CL_MPCount=2 /verbosity:minimal
           if ($LASTEXITCODE) { throw "Blender build failed: $LASTEXITCODE" }
 
       - name: Verify compiled features and GPU kernels
