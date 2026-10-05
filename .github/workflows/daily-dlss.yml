@@ -54,10 +54,14 @@ jobs:
       - name: Cache Blender precompiled libraries
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}\..\lib
+          path: ${{ github.workspace }}\lib\windows_x64
           key: blender-win-libs-${{ hashFiles('build_files/build_environment/cmake/versions.cmake', 'build_files/build_environment/cmake/options.cmake') }}
           restore-keys: |
             blender-win-libs-
+
+      - name: Fetch Blender precompiled libraries
+        shell: cmd
+        run: git submodule update --init --depth 1 lib/windows_x64
 
       - name: Update Blender dependencies
         shell: cmd
