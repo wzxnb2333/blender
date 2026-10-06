@@ -13,9 +13,6 @@ on:
         required: false
         default: sm_75;sm_86;sm_89;sm_90;sm_120;compute_75
         type: string
-  schedule:
-    # 10:17 Asia/Shanghai; GitHub may delay scheduled runs.
-    - cron: "17 2 * * *"
 
 permissions:
   contents: read
