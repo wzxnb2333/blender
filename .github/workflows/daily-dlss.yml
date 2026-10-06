@@ -103,6 +103,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: |
             include
+            lib/Windows_x86_64/rel
           lfs: false
 
       - name: Checkout OptiX SDK headers (v9.0.0)
@@ -172,6 +173,12 @@ jobs:
 
       - name: Verify compiled features and GPU kernels
         run: |
+          $runtime = Join-Path $env:GITHUB_WORKSPACE 'third_party/DLSS/lib/Windows_x86_64/rel'
+          foreach ($name in 'nvngx_dlssd.dll', 'nvngx_dlss.dll', 'nvngx_dlssg.dll') {
+            $source = Join-Path $runtime $name
+            if (-not (Test-Path $source)) { throw "DLSS runtime is missing: $name" }
+            Copy-Item $source $env:PACKAGE_DIR -Force
+          }
           $blender = Join-Path $env:PACKAGE_DIR 'blender.exe'
           if (-not (Test-Path $blender)) { throw 'Installed blender.exe is missing' }
           $check = "import _cycles; assert _cycles.with_dlss, 'DLSS disabled'; d = _cycles.get_device_types(); assert d[0] and d[1], ('CUDA/OptiX disabled', d); print('DLSS, CUDA, OptiX compile checks passed')"
@@ -202,7 +209,7 @@ jobs:
 
           Compile checks passed for DLSS, CUDA and OptiX. Actual GPU rendering is
           not tested on the GitHub runner. DLSS needs a compatible NVIDIA RTX GPU
-          and driver. This build does not bundle NVIDIA DLSS runtime DLLs.
+          and driver. The portable root bundles NVIDIA DLSS runtime DLLs.
           Select Cycles > Sampling > Viewport > Denoise > DLSS to try it.
           SDK version 310.9.1 alone does not prove a DLSS 4.5 runtime/model is active.
           "@ | Set-Content -Encoding utf8 (Join-Path $env:PACKAGE_DIR 'DAILY_DLSS_README.txt')
